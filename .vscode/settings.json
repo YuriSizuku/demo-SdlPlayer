@@ -1,0 +1,17 @@
+{
+    "files.associations": {
+        "avformat.h": "c",
+        "*.inc": "c",
+        "swscale.h": "c",
+        "*.def": "c",
+        "limits": "c",
+        "functional": "c",
+        "sdl.h": "c",
+        "imgutils.h": "c",
+        "audio_fifo.h": "c",
+        "swresample.h": "c",
+        "array": "c",
+        "string": "c",
+        "string_view": "c"
+    }
+}
