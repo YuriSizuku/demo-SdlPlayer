@@ -1,0 +1,100 @@
+name: build sdl player
+on:
+  push: {tags:  ['v*']} #  Push events to matching v*, i.e. v1.0, v20.15.10
+  pull_request: 
+
+permissions:
+  contents: write
+
+env:
+  THIRDPARTY_BUILD_URL: https://github.com/YuriSizuku/SdlPlayer/releases/download/vasset/thirdparty_build.tar.gz
+
+jobs:
+  fetch_thirdparty_build:
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: check thirdparty build
+      id: check_thirdparty_build
+      uses: actions/cache@v3
+      with: 
+        path: ./thirdparty/build
+        key: thirdparty_build
+    
+    - name: fetch thirdparty build
+      if: steps.check_thirdparty_build.outputs.cache-hit != 'true'
+      run: |
+        wget ${{ env.THIRDPARTY_BUILD_URL }}
+        tar xvzf thirdparty_build.tar.gz
+
+  build_win:
+    runs-on: ubuntu-20.04
+    needs: 
+      - fetch_thirdparty_build
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: get thirdparty build cache
+      uses: actions/cache@v3
+      with: 
+        key: thirdparty_build
+        path: ./thirdparty/build
+    
+    - name: Set up MinGW
+      uses: egor-tensin/setup-mingw@v2
+      with:
+        platform: x64
+
+    - name: build sdl_player
+      run: |
+        cd script && chmod +x *.sh
+        bash -c "export SKIP_PORTS=yes && ./local_mingw64.sh"
+
+    - name: prepare release
+      run: |
+        cp thirdparty/build/arch_mingw64/bin/av*.dll build_mingw64/
+        cp thirdparty/build/arch_mingw64/bin/sw*.dll build_mingw64/
+        cd build_mingw64 && 7z a sdlplayer_${{  github.ref_name }}_x64_win.7z
+    
+    - name: create release
+      uses: ncipollo/release-action@v1
+      if: github.event_name == 'push'
+      with:
+        artifacts: "./build_mingw64/*.7z"
+        allowUpdates: "true"
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+  build_linux:
+    runs-on: ubuntu-20.04
+    needs: 
+      - fetch_thirdparty_build
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: get thirdparty build cache
+      uses: actions/cache@v3
+      with: 
+        key: thirdparty_build
+        path: ./thirdparty/build
+
+    - name: build sdl_player
+      run: |
+        cd script && chmod +x *.sh
+        bash -c "export SKIP_PORTS=yes && ./local_linux64.sh"
+
+    - name: prepare release
+      run: |
+        cd build_linux64
+        cp sdl_player sdlplayer_${{  github.ref_name }}_x64_linux
+        strip sdlplayer_${{  github.ref_name }}_x64_linux
+    
+    - name: create release
+      uses: ncipollo/release-action@v1
+      if: github.event_name == 'push'
+      with:
+        artifacts: "./build_linux64/sdlplayer_${{  github.ref_name }}_x64_linux"
+        allowUpdates: "true"
+        token: ${{ secrets.GITHUB_TOKEN }}
