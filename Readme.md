@@ -6,7 +6,7 @@ This is a simple video/audio syncronized player, showing how to use ffmpeg.
 
 ## Build  
 
-- Windows Mingw64 (msys2)
+- Windows Mingw64 (msys2)  
 See `local_mingw64.sh` in detail, must use msys2 shell to compile ffmpeg.  
 
 ``` shell
@@ -16,8 +16,8 @@ pacman -S --noconfirm mingw-w64-x86_64-binutils mingw-w64-x86_64-gcc mingw-w64-x
 cd script && sh ./local_mingw64.sh
 ```
 
-- Linux Mingw64
-Some problems for building ffmpeg.  
+- Linux Mingw64  
+This might cause some problems in ffmpeg.  
 
 ``` shell
 sudo apt-get -y update 
@@ -26,7 +26,7 @@ sudo apt-get -y install mingw-w64
 cd script && bash -c "export SKIP_PORTS=yes && ./local_mingw64.sh"
 ```
 
-- Linux x64
+- Linux x64  
 See `local_linux64.sh` in detail.  
 
 ``` shell

@@ -6,8 +6,10 @@
 #define SAMPLE_RATE 44100
 #define CHANNELS 2
 #define SAMPLES 4096
-#define AUDIO_FRAME_SIZE SAMPLES*CHANNELS*2
-#define AUDIO_FRAME_NUM 10
+#define AFRAME_SIZE SAMPLES*CHANNELS*2
+#define AFRAME_NUM 100
+#define VFRAME_NUM 25
+#define SYNC_THRESHOLD (double)SAMPLES/(double)SAMPLE_RATE*1000.f/3.f
 #define TRUE 1
 #define FALSE 0
 typedef int bool;
@@ -19,6 +21,7 @@ static SDL_Window* g_window;
 static SDL_Renderer* g_renderer;
 static SDL_Texture* g_videotex;
 static SDL_mutex* g_audiomutex;
+static SDL_mutex* g_videomutex;
 static SDL_AudioDeviceID g_audio;
 static SDL_AudioSpec g_audiospec;
 static char g_videopath[260] = {0};
@@ -30,6 +33,7 @@ static char g_videopath[260] = {0};
 #include <libswresample/swresample.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/audio_fifo.h>
+#include <libavutil/fifo.h>
 
 // ffmpeg context
 static AVFormatContext *g_avformatctx;
@@ -39,7 +43,8 @@ static int g_vindex, g_aindex;
 // ffmpeg avpacket, avframe, fifo, status
 static AVPacket *g_avpacket;
 static AVFrame *g_vframe, *g_aframe;
-static struct AVAudioFifo *g_audiofifo;
+static struct AVAudioFifo *g_asamplefifo; // store audio pcm sample
+static struct AVFifoBuffer *g_vframefifo; // store AVFrame*
 static double g_audiotime = 0; // ms
 static enum PLAYER_STATUS{
     STATUS_INIT,
@@ -53,8 +58,8 @@ static struct SwrContext *g_swrctx = NULL;
 static uint8_t* g_yuvdata[4] = {NULL};
 static int g_yuvlinesize[4] = {0};
 
-// util
-static AVFrame* make_target_aframe()
+// ffmpeg function
+static AVFrame* ff_target_aframe()
 {
     AVFrame *tmpaframe = av_frame_alloc();
     tmpaframe->nb_samples = SAMPLES;
@@ -65,70 +70,100 @@ static AVFrame* make_target_aframe()
     return tmpaframe;
 }
 
-// callback
-static void audio_callback(void *userdata, Uint8 *stream, int len)
+static int ff_demux(void *args)
 {
-    memset(stream, 0, len); // make silence
-    if(!g_audiofifo) return;
-    if(g_playerstatus == STATUS_PAUSE) return;
+    int res = 0;
 
-    int desired_samples = len / CHANNELS / 2;
-    int read_samples = 0;
-    AVFrame *tmpaframe = make_target_aframe();
-    SDL_LockMutex(g_audiomutex);
-    read_samples = av_audio_fifo_read(g_audiofifo, (void**)tmpaframe->data, desired_samples);
-    SDL_UnlockMutex(g_audiomutex);
-    
-    if(read_samples>0)
+    // audio is important, must be enough
+    if(av_audio_fifo_size(g_asamplefifo) > 3*SAMPLES)
     {
-        // can not use MixAudio here
-        SDL_MixAudioFormat(stream, tmpaframe->data[0], 
-            g_audiospec.format, read_samples*CHANNELS*2, SDL_MIX_MAXVOLUME);
-        g_audiotime += ((double)read_samples / SAMPLE_RATE)*1000; 
+        if(av_audio_fifo_space(g_asamplefifo) < SAMPLES) res = 1;
+        if(av_fifo_space(g_vframefifo) < sizeof(AVFrame*) ) res = 2;
+        if(res!=0) return res;
     }
-    av_frame_unref(tmpaframe);
-    av_frame_free(&tmpaframe);
+
+    res = av_read_frame(g_avformatctx, g_avpacket);
+    if(res ==0)
+    {
+        if(g_avpacket->stream_index == g_vindex)
+        {
+            // SDL_Log("ff_demux video");
+            res = avcodec_send_packet(g_vcodecctx, g_avpacket);
+        }
+        else if(g_avpacket->stream_index == g_aindex)
+        {
+            // SDL_Log("ff_demux audio");
+            res = avcodec_send_packet(g_acodecctx, g_avpacket);
+        }
+        av_packet_unref(g_avpacket);
+    }
+    return res;
 }
 
-// event loop
-static int init_sdl()
+// audio decode, to g_asamplefifo
+static int ff_adecode(void *args)
 {
-    int res;
-
-    // init sdl video
-    if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS))
-    {
-         SDL_Log("SDL_Init failed, %s", SDL_GetError());
-         return -1;
-    }
+    // must recive after send packet or some frame will lost
+    if(av_audio_fifo_space(g_asamplefifo) < SAMPLES) return 1;
     
-    g_window = SDL_CreateWindow("sdl_player", 
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
-        WINDOW_W, WINDOW_H, SDL_WINDOW_OPENGL);
-    g_renderer = SDL_CreateRenderer(g_window, -1, 
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
-    g_videotex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_YV12, 
-        SDL_TEXTUREACCESS_STREAMING, WINDOW_W, WINDOW_H);
-    SDL_SetRenderDrawColor(g_renderer, 0xff, 0xc0, 0xcb, 0xff);
-    SDL_RenderClear(g_renderer);
+    int res = 0;
+    AVFrame *tmpaframe = ff_target_aframe();
+    res = avcodec_receive_frame(g_acodecctx, g_aframe);
 
-    // init sdl audio
-    g_audiomutex = SDL_CreateMutex();
-    SDL_AudioSpec desired;
-	SDL_zero(desired);
-	desired.freq = SAMPLE_RATE;
-	desired.format = AUDIO_S16;
-	desired.channels = CHANNELS;
-	desired.samples = SAMPLES;
-	desired.callback = audio_callback;
+    if(res==0)
+    {
+        // SDL_Log("ff_adecode");
+        swr_convert_frame(g_swrctx, tmpaframe, g_aframe);
+        
+        SDL_LockMutex(g_audiomutex);
+        av_audio_fifo_write(g_asamplefifo, (void**)tmpaframe->data, tmpaframe->nb_samples);
+        SDL_UnlockMutex(g_audiomutex);
+        
+        av_frame_unref(tmpaframe);
+        av_frame_unref(g_aframe);
+    }
 
-	g_audio = SDL_OpenAudioDevice(NULL, 0, &desired, &g_audiospec, 0);
-    SDL_PauseAudioDevice(g_audio, 0);
+    av_frame_free(&tmpaframe);
+    return res;
+}
+
+// video decode, to g_vframefifo
+static int ff_vdecode(void *args)
+{
+    if(av_fifo_space(g_vframefifo) < sizeof(AVFrame*) ) return 1;
+    
+    int res = 0;
+    res = avcodec_receive_frame(g_vcodecctx, g_vframe);
+    if(res==0)
+    {
+        // SDL_Log("ff_vdecode");
+        SDL_LockMutex(g_videomutex);
+        AVFrame *tmpvframe = av_frame_clone(g_vframe);
+        av_fifo_generic_write(g_vframefifo, (void*)&tmpvframe, sizeof(tmpvframe), NULL);
+        SDL_UnlockMutex(g_videomutex);
+    }
+
+    return res;
+}
+
+// make fifo full
+static void ff_fullfifo()
+{
+    enum PLAYER_STATUS oldstatus = g_playerstatus;
+    g_playerstatus = STATUS_PAUSE;
+    while(av_audio_fifo_space(g_asamplefifo) >= SAMPLES &&
+         av_fifo_space(g_vframefifo) >= sizeof(AVFrame*))
+    {
+        ff_demux(NULL);
+        ff_adecode(NULL);
+        ff_vdecode(NULL);
+    }
+    g_playerstatus = oldstatus;
 }
 
 static int init_ffmpeg()
 {
-    int res;
+    int res = 0;
     
     // init avformat, avcodec
     avformat_open_input(&g_avformatctx, g_videopath, NULL, NULL);
@@ -184,17 +219,82 @@ static int init_ffmpeg()
     g_avpacket = av_packet_alloc();
     g_vframe = av_frame_alloc();
     g_aframe = av_frame_alloc();
-    g_audiofifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_S16, CHANNELS, SAMPLES*AUDIO_FRAME_NUM);
+    g_asamplefifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_S16, CHANNELS, SAMPLES*AFRAME_NUM);
+    g_vframefifo = av_fifo_alloc_array(VFRAME_NUM, sizeof(AVFrame*));
 
     return res;
 }
 
+// sdl function
+static void sdl_audiocb(void *userdata, Uint8 *stream, int len)
+{
+    memset(stream, 0, len); // make silence
+    if(!g_asamplefifo) return;
+    if(g_playerstatus == STATUS_PAUSE) return;
+
+    int desired_samples = len / CHANNELS / 2;
+    int read_samples = 0;
+    AVFrame *tmpaframe = ff_target_aframe();
+    SDL_LockMutex(g_audiomutex);
+    read_samples = av_audio_fifo_read(g_asamplefifo, (void**)tmpaframe->data, desired_samples);
+    SDL_UnlockMutex(g_audiomutex);
+    
+    if(read_samples>0)
+    {
+        // can not use MixAudio here
+        SDL_MixAudioFormat(stream, tmpaframe->data[0], 
+            g_audiospec.format, read_samples*CHANNELS*2, SDL_MIX_MAXVOLUME);
+        g_audiotime += ((double)read_samples / SAMPLE_RATE)*1000; 
+    }
+    av_frame_unref(tmpaframe);
+    av_frame_free(&tmpaframe);
+}
+
+static int init_sdl()
+{
+    int res = 0;
+
+    // init sdl video
+    if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS))
+    {
+         SDL_Log("SDL_Init failed, %s", SDL_GetError());
+         return -1;
+    }
+    
+    g_window = SDL_CreateWindow("sdl_player", 
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
+        WINDOW_W, WINDOW_H, SDL_WINDOW_OPENGL);
+    g_renderer = SDL_CreateRenderer(g_window, -1, 
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
+    g_videotex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_YV12, 
+        SDL_TEXTUREACCESS_STREAMING, WINDOW_W, WINDOW_H);
+    SDL_SetRenderDrawColor(g_renderer, 0xff, 0xc0, 0xcb, 0xff);
+    SDL_RenderClear(g_renderer);
+
+    // init sdl audio
+    g_audiomutex = SDL_CreateMutex();
+    g_videomutex = SDL_CreateMutex();
+    SDL_AudioSpec desired;
+	SDL_zero(desired);
+	desired.freq = SAMPLE_RATE;
+	desired.format = AUDIO_S16;
+	desired.channels = CHANNELS;
+	desired.samples = SAMPLES;
+	desired.callback = sdl_audiocb;
+
+	g_audio = SDL_OpenAudioDevice(NULL, 0, &desired, &g_audiospec, 0);
+    SDL_PauseAudioDevice(g_audio, 0);
+}
+
+
+// event loop
 static int on_init()
 {
     if(!g_videopath[0]) return -1;
 
     init_sdl();
     init_ffmpeg();
+    ff_fullfifo();
 
     return 0;
 }
@@ -203,8 +303,32 @@ static int on_reset()
 {
     SDL_Log("# on_reset");
     g_audiotime = 0;
+    
+    SDL_LockMutex(g_audiomutex);
+    av_audio_fifo_reset(g_asamplefifo);
+    SDL_UnlockMutex(g_audiomutex);
+    
+    SDL_LockMutex(g_videomutex);
+    while (av_fifo_size(g_vframefifo) > 0)
+    {
+        AVFrame *tmpvframe;
+        av_fifo_generic_read(g_vframefifo, (void*)&tmpvframe, sizeof(tmpvframe), NULL);
+        if(tmpvframe)
+        {
+            av_frame_unref(tmpvframe);
+            av_frame_free(&tmpvframe);
+        }
+    }
+    av_fifo_reset(g_vframefifo);
+    SDL_UnlockMutex(g_videomutex);
+
+    while (avcodec_receive_frame(g_vcodecctx, g_vframe)==0)
+    {
+        av_frame_unref(g_vframe);
+    }
     avformat_seek_file(g_avformatctx, -1, INT64_MIN, 0, INT64_MAX, AVSEEK_FLAG_FRAME);
-    av_audio_fifo_reset(g_audiofifo);
+    ff_fullfifo();
+    
     return 0;
 }
 
@@ -223,6 +347,7 @@ static int on_cleanup()
     SDL_DestroyRenderer(g_renderer);
     SDL_DestroyWindow(g_window);
     SDL_DestroyMutex(g_audiomutex);
+    SDL_DestroyMutex(g_videomutex);
     SDL_PauseAudioDevice(g_audio, 0);
     SDL_CloseAudioDevice(g_audio);
 
@@ -233,7 +358,8 @@ static int on_cleanup()
     av_packet_free(&g_avpacket);
     av_frame_free(&g_vframe);
     av_frame_free(&g_aframe);
-    av_audio_fifo_free(g_audiofifo);
+    av_audio_fifo_free(g_asamplefifo);
+    av_fifo_freep(&g_vframefifo);
     
     av_freep(&g_yuvdata[0]);
     avcodec_close(g_vcodecctx);
@@ -243,7 +369,7 @@ static int on_cleanup()
     return 0;
 }
 
-int on_event()
+static int on_event()
 {
 	SDL_Event event;
 	while (SDL_PollEvent(&event))
@@ -279,69 +405,79 @@ int on_event()
 
 static int on_update()
 {
-    if(g_playerstatus == STATUS_PAUSE) return 0;
+    static bool s_newframe = TRUE;
+    static Uint32 s_prevtime = 0;
+    static double s_lastaudiotime = 0;
 
-    int res;
-    int nb_samples = av_audio_fifo_size(g_audiofifo);
-    int nb_maxsamples = SAMPLES * AUDIO_FRAME_NUM;
-    if(nb_samples >= nb_maxsamples) return 1;
-
-    // demux
-    res = av_read_frame(g_avformatctx, g_avpacket);
-    if(res ==0)
+    if(g_playerstatus == STATUS_PAUSE) 
     {
-        if(g_avpacket->stream_index == g_vindex)
-        {
-            res = avcodec_send_packet(g_vcodecctx, g_avpacket);
-        }
-        else if(g_avpacket->stream_index == g_aindex)
-        {
-            res = avcodec_send_packet(g_acodecctx, g_avpacket);
-        }
-        av_packet_unref(g_avpacket);
+        s_newframe = TRUE;
+        return 0;
     }
 
-    // decode audio
-    // must recive after send packet or some frame will lost
-    res = avcodec_receive_frame(g_acodecctx, g_aframe); 
-    if(res==0) 
+    int res = 0;
+    if(res==0)
     {
-        AVFrame *tmpaframe = make_target_aframe();
-        swr_convert_frame(g_swrctx, tmpaframe, g_aframe);
-        
-        SDL_LockMutex(g_audiomutex);
-        av_audio_fifo_write(g_audiofifo, (void**)tmpaframe->data, tmpaframe->nb_samples);
-        SDL_UnlockMutex(g_audiomutex);
-        
-        av_frame_unref(tmpaframe);
-        av_frame_free(&tmpaframe);
-        av_frame_unref(g_aframe);
+        ff_demux(NULL);
+        ff_adecode(NULL);
+        ff_vdecode(NULL);
     }
 
-    // decode video
-    while(avcodec_receive_frame(g_vcodecctx, g_vframe)==0)
+    // update vframe
+    SDL_LockMutex(g_videomutex);
+    if(av_fifo_size(g_vframefifo) > 0 )
     {
-        double videotime = av_q2d(g_avformatctx->streams[g_vindex]->time_base) * g_vframe->pts * 1000;
-        // SDL_Log("videotime=%lf audiotime=%lf\n", videotime, g_audiotime);
-        if (videotime > g_audiotime)
+        AVFrame *tmpvframe;
+        av_fifo_generic_peek(g_vframefifo, &tmpvframe, sizeof(tmpvframe), NULL);
+        if(tmpvframe)
         {
-            // sync video with audio time
-            Uint32 start = SDL_GetTicks();
-            sws_scale(g_swsctx, (const uint8_t *const*)g_vframe->data, g_vframe->linesize, 
-                0, g_vcodecctx->height, g_yuvdata, g_yuvlinesize);
-            SDL_UpdateYUVTexture(g_videotex, NULL, 
-                g_yuvdata[0], g_yuvlinesize[0],
-                g_yuvdata[1], g_yuvlinesize[1],
-                g_yuvdata[2], g_yuvlinesize[2]
-            );
-            Uint32 now = SDL_GetTicks();
-            int delay = videotime - g_audiotime - (now - start);
-            // SDL_Log("delay=%d", delay);
-            if(delay>0 && delay<100 && g_audiotime>0.01) SDL_Delay(delay);
-        }
+            double videotime = av_q2d(g_avformatctx->streams[g_vindex]->time_base) * tmpvframe->pts * 1000;
+            double delaytime = videotime - g_audiotime;
 
-        av_frame_unref(g_vframe);
+            // if audiotime not update yet, calculate the time based on newframe pts
+            if(!s_newframe && s_lastaudiotime==g_audiotime)
+            {
+                delaytime -= SDL_GetTicks() - s_prevtime;
+            }
+            s_lastaudiotime = g_audiotime;
+#if 0
+            SDL_Log("updatevframe: fifo_v=%d, fifo_a=%d, vtime=%.1lf, atime=%.1lf | newframe=%d delay=%.1lf\n", 
+                av_fifo_size(g_vframefifo)/sizeof(tmpvframe), 
+                av_audio_fifo_size(g_asamplefifo)/SAMPLES,
+                videotime, g_audiotime, s_newframe, delaytime);
+#endif
+            bool removeflag = FALSE;
+            bool renderflag = FALSE;
+            if(delaytime < 0)
+            {
+                if(delaytime >= -SYNC_THRESHOLD) renderflag = TRUE;
+                else removeflag = TRUE;
+            }
+            else 
+            {
+                if (delaytime <= SYNC_THRESHOLD) renderflag = TRUE;
+                else if(delaytime >= 2000.f) removeflag = TRUE; // on_reset
+            }
+
+            if(renderflag)
+            {
+                sws_scale(g_swsctx, (const uint8_t *const*)tmpvframe->data, tmpvframe->linesize, 
+                    0, g_vcodecctx->height, g_yuvdata, g_yuvlinesize);
+                removeflag = TRUE;
+            }
+            
+            if(removeflag)
+            {
+                av_fifo_drain(g_vframefifo, sizeof(tmpvframe));
+                av_frame_unref(tmpvframe);
+                av_frame_free(&tmpvframe);
+            }
+            s_newframe = removeflag;
+            if(s_newframe) s_prevtime = SDL_GetTicks();
+        }
     }
+    SDL_UnlockMutex(g_videomutex);
+
     return 0;
 }
 
@@ -351,6 +487,11 @@ static int on_render()
     Uint32 time = SDL_GetTicks();
     if( time - s_lasttime >= (Uint32)(1./FPS))
     {
+        SDL_UpdateYUVTexture(g_videotex, NULL, 
+            g_yuvdata[0], g_yuvlinesize[0],
+            g_yuvdata[1], g_yuvlinesize[1],
+            g_yuvdata[2], g_yuvlinesize[2]
+        );
         SDL_RenderCopy(g_renderer, g_videotex, NULL, NULL);
         SDL_RenderPresent(g_renderer);
         s_lasttime = time;

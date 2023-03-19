@@ -9,7 +9,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build_mingw64/sdl_player.exe",
-            "args": ["test.mkv"],
+            "args": ["${workspaceFolder}/asset/test.mkv"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build_mingw64",
             "environment": [
